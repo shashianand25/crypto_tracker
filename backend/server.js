@@ -1,3 +1,4 @@
+import { startIngestor } from './ingestor.js';
 import express from 'express';
 import cors from 'cors';
 
@@ -27,4 +28,7 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-app.listen(3000, () => console.log('API running on http://localhost:3000'));
+app.listen(3000, () => {
+  console.log('API running on http://localhost:3000');
+  startIngestor();
+});
