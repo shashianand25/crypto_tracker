@@ -1,13 +1,19 @@
 import express from 'express';
 import cors from 'cors';
 import http from 'node:http';
-import WebSocket, { WebSocketServer } from 'ws';
-import { client, types } from './db.js';
-import { startIngestor, feed, status, SYMBOLS } from './ingestor.js';
+import { client, connectDb } from './db.js';
+import { config } from './config.js';
+import { startIngestor, stopIngestor, feed, SYMBOLS } from './ingestor.js';
+import { getHealth } from './health.js';
+import { HOUR, DAY, parseRange, fetchCandles } from './util.js';
+import { router } from './routes.js';
+import { attachWebSocket, broadcast, bus, closeWebSocket } from './live.js';
+import { loadActiveAlerts, startAlerts } from './alerts.js';
+import { startAnomalyDetector } from './anomaly.js';
 
 const app = express();
-app.use(cors({ origin: 'http://localhost:5173', credentials: true }));
-app.use(express.json());
+app.use(cors({ origin: config.corsOrigin, credentials: true }));
+app.use(express.json({ limit: '10kb' }));   // alert bodies are tiny; reject anything bigger
 
 const ASSETS = [
   { symbol: 'BTCUSDT', name: 'Bitcoin',  baseAsset: 'BTC', quoteAsset: 'USDT', status: 'TRADING' },
@@ -17,17 +23,8 @@ const ASSETS = [
 
 // default time window when the frontend doesn't send ?from=
 const LOOKBACK_HOURS = { '1m': 24, '5m': 72, '1h': 168 };
-const MAX_DAYS = 14;
 
 // ---------- helpers ----------
-
-// accepts ISO strings, unix seconds, or unix milliseconds
-function parseTime(value, fallback) {
-  if (value === undefined || value === '') return fallback;
-  const s = String(value);
-  const d = /^\d+$/.test(s) ? new Date(s.length <= 10 ? Number(s) * 1000 : Number(s)) : new Date(s);
-  return Number.isNaN(d.getTime()) ? null : d;
-}
 
 async function getLatest(symbol) {
   const { rows } = await client.execute(
@@ -66,36 +63,12 @@ app.get('/api/prices/:symbol/history', async (req, res) => {
     return res.status(400).json({ error: 'interval must be 1m, 5m or 1h' });
   }
 
-  const to = parseTime(req.query.to, new Date());
-  if (!to) return res.status(400).json({ error: 'invalid "to" time' });
-  const from = parseTime(req.query.from, new Date(to.getTime() - LOOKBACK_HOURS[interval] * 3_600_000));
-  if (!from) return res.status(400).json({ error: 'invalid "from" time' });
-  if (from > to) return res.status(400).json({ error: '"from" must be before "to"' });
+  const range = parseRange(req.query, { defaultMs: LOOKBACK_HOURS[interval] * HOUR, maxMs: 14 * DAY });
+  if (range.error) return res.status(400).json({ error: range.error });
 
-  // Our table is partitioned by (symbol, timeframe, day), so we need one query per UTC day
-  const days = [];
-  for (
-    let t = Date.UTC(from.getUTCFullYear(), from.getUTCMonth(), from.getUTCDate());
-    t <= to.getTime();
-    t += 86_400_000
-  ) {
-    days.push(types.LocalDate.fromString(new Date(t).toISOString().slice(0, 10)));
-  }
-  if (days.length > MAX_DAYS) return res.status(400).json({ error: `range too large (max ${MAX_DAYS} days)` });
-
-  const results = await Promise.all(
-    days.map((day) =>
-      client.execute(
-        `SELECT ts, open, high, low, close, volume FROM candles_by_symbol_day
-         WHERE symbol = ? AND timeframe = ? AND day = ? AND ts >= ? AND ts <= ?`,
-        [symbol, interval, day, from, to],
-        { prepare: true }
-      )
-    )
-  );
-
-  // each partition is already oldest-to-newest, and days are in order, so the result is too
-  const points = results.flatMap((r) => r.rows).map((r) => ({
+  // one query per UTC day partition, merged oldest-to-newest (see util.js)
+  const rows = await fetchCandles(symbol, interval, range.from, range.to);
+  const points = rows.map((r) => ({
     price: r.close.toString(),
     volume: r.volume.toString(),
     ts: r.ts.toISOString(),
@@ -107,45 +80,66 @@ app.get('/api/prices/:symbol/history', async (req, res) => {
   res.json(points);
 });
 
-app.get('/api/health', (req, res) => {
-  const healthy = status.connected && status.dbOk;
-  res.json({
-    status: healthy ? 'healthy' : 'degraded',
-    healthy,
-    uptime: Math.floor(process.uptime()),
-    dataCollectionStatus: status.connected ? 'STREAMING' : 'DISCONNECTED',
-    latestDataTimestamp: status.lastTickAt,
-    backendAvailability: 'HIGH_AVAILABILITY',
-    services: {
-      binance_feed: status.connected ? 'CONNECTED' : 'DISCONNECTED',
-      database: status.dbOk ? 'OK' : 'ERROR',
-      ws_broadcaster: 'ACTIVE',
-    },
-  });
-});
+app.get('/api/health', async (req, res) => res.json(await getHealth()));
+
+// compare + replay live in routes.js
+app.use('/api', router);
+
+// any other /api/... URL: JSON 404 instead of Express's default HTML page
+app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));
 
 // must come after all routes: catches errors thrown inside them
 app.use((err, req, res, next) => {
+  if (err.status >= 400 && err.status < 500) {   // e.g. malformed JSON body
+    return res.status(err.status).json({ error: err.type === 'entity.parse.failed' ? 'Invalid JSON body' : err.message });
+  }
   console.error(err);
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// ---------- live WebSocket ----------
+// ---------- startup ----------
+
+process.on('unhandledRejection', (reason) => console.error('unhandled rejection:', reason));
 
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: '/ws/live' });
+attachWebSocket(server);
+feed.on('tick', broadcast);            // every trade goes to browsers
+bus.on('alert', broadcast);            // fired alerts too
+bus.on('anomaly', broadcast);          // and detected anomalies
+server.on('error', (err) => { console.error('HTTP server error:', err.message); process.exit(1); });
 
-function broadcast(message) {
-  const text = JSON.stringify(message);
-  for (const socket of wss.clients) {
-    if (socket.readyState === WebSocket.OPEN) socket.send(text);
-  }
+try {
+  await connectDb();                   // do not accept requests until Cassandra works
+  await loadActiveAlerts();
+} catch (err) {
+  console.error(err.message);
+  process.exit(1);
 }
 
-wss.on('connection', () => console.log('browser connected, total clients:', wss.clients.size));
-feed.on('tick', broadcast);
-
-server.listen(3000, () => {
-  console.log('API running on http://localhost:3000');
+server.listen(config.port, () => {
+  console.log(`API running on http://localhost:${config.port}`);
+  startAlerts();
+  startAnomalyDetector();
   startIngestor();
 });
+
+// ---------- graceful shutdown (Ctrl+C or kill) ----------
+
+let shuttingDown = false;
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`${signal} received, shutting down...`);
+  setTimeout(() => process.exit(1), 10_000).unref();   // failsafe if something hangs
+  try {
+    await stopIngestor();              // timers, Binance socket, final flush
+    await closeWebSocket();            // browsers
+    await new Promise((resolve) => server.close(resolve));   // HTTP
+    await client.shutdown();           // Cassandra connections
+  } catch (err) {
+    console.error('error during shutdown:', err.message);
+  }
+  process.exit(0);
+}
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
